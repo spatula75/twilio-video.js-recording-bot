@@ -1,4 +1,4 @@
-'use strict';
+//'use strict';
 
 require('dotenv').config();
 
@@ -11,6 +11,7 @@ const { join } = require('path');
 const puppeteer = require('puppeteer');
 const { AccessToken } = require('twilio').jwt;
 const winston = require('winston');
+const readline = require('readline'); // so we can securely receive the token and room name.
 
 const app = express();
 
@@ -44,17 +45,7 @@ app.get('/bundle.js', browserify([
 app.use(loggerMiddleware);
 
 async function main({ port, token, roomSid }) {
-  logger.info(`
-
-  recording-bot's PID is ${process.pid}.
-
-  You can send SIGUSR2 to this PID to cause recording-bot to stop recording and to
-  disconnect from the Room. For example,
-
-    kill -s USR2 ${process.pid}
-
-  Happy recording!
-`);
+  console.log(`PID=${process.pid}\n`);
 
   logger.debug('Starting HTTP server...');
   server = await listen(port);
@@ -66,8 +57,10 @@ async function main({ port, token, roomSid }) {
 
   logger.debug('Launching browser...');
   browser = await puppeteer.launch({
+    executablePath: '/usr/local/bin/chromium-browser',
     args: [
-      '--disable-gesture-requirement-for-media-playback'
+      '--disable-gesture-requirement-for-media-playback',
+      '--disable-dev-shm-usage'
     ]
   });
   logger.info('Launched browser.');
@@ -97,18 +90,34 @@ async function main({ port, token, roomSid }) {
     page.exposeFunction('debug', message => { logger.debug(message); }),
     page.exposeFunction('error', message => { logger.error(message); }),
     page.exposeFunction('info', message => { logger.info(message); }),
-    page.exposeFunction('createRecording', filepath => {
+    page.exposeFunction('parentClose', close),
+    page.exposeFunction('createRecording', (filepath, metapath, mimeType) => {
       mkdirp(join(...filepath.slice(0, filepath.length - 1)));
+
+      metaData =  { createTime: Date.now(), contentType: mimeType };
+      metaString = JSON.stringify(metaData);
+      appendFile(join(...metapath), Buffer.from(stringToArrayBuffer(metaString)), error => {
+        if (error) {
+          logger.error(`\nError writing metadata\n${indent(error.stack)}\n`);
+          return;
+        }
+      });
+      logger.info(`Created ${join(...filepath)} and wrote metadata ${metaString}`);
     }),
-    page.exposeFunction('appendRecording', (filepath, chunk) => {
+    page.exposeFunction('appendRecording', (filepath, chunk, start) => {
       const filename = join(...filepath);
-      const buffer = new Buffer(stringToArrayBuffer(chunk));
-      appendFile(filename, buffer, error => {
+      // NOTE: If we use Buffer.from instead of new Uint8Array here, the video gets corrupted almost immediately.
+      // Presumably something in the semantics of appendFile treats the buffer content differently if it's a Buffer vs
+      // if it's a Uint8Array.
+      // The original code did new Buffer(stringToArrayBuffer(chunk)) which got warnings about a deprecated constructor.
+      const buffer = new Uint8Array(stringToArrayBuffer(chunk));
+      appendFile(filename, buffer, 'binary', error => {
         if (error) {
           logger.error(`\n\n${indent(error.stack)}\n`);
           return;
         }
-        logger.debug(`Wrote chunk (${buffer.byteLength} bytes)`);
+        let elapsed = Date.now() - start;
+        logger.debug(`Wrote ${buffer.length} bytes to ${filename} in ${elapsed}ms`);
       });
     })
   ]);
@@ -126,7 +135,7 @@ async function main({ port, token, roomSid }) {
     await close();
     return;
   }
-}
+} // main
 
 function listen(port) {
   return new Promise((resolve, reject) => {
@@ -146,6 +155,16 @@ async function close(error) {
     logger.error(`\n\n${indent(error.stack)}\n`);
   }
 
+  if (page) {
+    logger.debug('Shutting down any remaining recorders and disconnecting room...');
+    await page.evaluate(`shutdown()`);
+    logger.info('All recorders shut down and room disconnected.');
+  }
+
+  logger.info('Waiting 10 seconds for everything to finish before exiting...')
+
+  await new Promise(resolve => setTimeout(resolve, 10000));
+
   if (server) {
     logger.debug('Closing HTTP server...');
     server.close();
@@ -153,7 +172,9 @@ async function close(error) {
   }
 
   if (page) {
+    logger.debug('Closing page...')
     await page.evaluate('close()');
+    logger.info('Closed page.')
   }
 
   if (browser) {
@@ -174,10 +195,11 @@ function indent(str, n) {
 }
 
 function stringToArrayBuffer(string) {
+  const length = string.length;
   const buf = new ArrayBuffer(string.length);
   const bufView = new Uint8Array(buf);
 
-  for (let i=0; i < string.length; i++) {
+  for (let i=0; i < length; i++) {
     bufView[i] = string.charCodeAt(i);
   }
 
@@ -195,29 +217,30 @@ function stringToArrayBuffer(string) {
   });
 });
 
-const roomSid = process.argv.length > 2
-  ? process.argv[2]
-  : null;
+// Code execution actually begins here 
 
-function createToken(identity) {
-  const token = new AccessToken(
-    process.env.ACCOUNT_SID,
-    process.env.API_KEY_SID,
-    process.env.API_KEY_SECRET);
-  token.identity = identity;
-  token.addGrant(new AccessToken.VideoGrant());
-  return token.toJwt();
-}
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
 
-const token = createToken('recording-bot');
+// get params from stdin, separated by spaces. readline blocks waiting for stdin if you use the 'question' interface.
+rl.question('', (answer) => {
+  rl.close();
+  var port, token, roomSid;
+  [port, token, roomSid] = answer.split(' ');
 
-const configuration = {
-  port: 3000,
-  token,
-  roomSid
-};
+  port = parseInt(port)
 
-main(configuration).catch(error => {
-  shouldClose = true;
-  close(error);
+  const configuration = {
+    port,
+    token,
+    roomSid
+  };
+
+  main(configuration).catch(error => {
+    shouldClose = true;
+    close(error);
+  });
 });
